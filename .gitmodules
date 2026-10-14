@@ -1,0 +1,9 @@
+[submodule "third-party/open.mp-sdk"]
+	path = third-party/open.mp-sdk
+	url = https://github.com/openmultiplayer/open.mp-sdk.git
+[submodule "third-party/compiler"]
+	path = third-party/compiler
+	url = https://github.com/openmultiplayer/compiler.git
+[submodule "third-party/asmjit"]
+	path = third-party/asmjit
+	url = https://github.com/asmjit/asmjit.git
