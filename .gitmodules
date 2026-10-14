@@ -7,3 +7,6 @@
 [submodule "third-party/asmjit"]
 	path = third-party/asmjit
 	url = https://github.com/asmjit/asmjit.git
+[submodule "third-party/subhook"]
+	path = third-party/subhook
+	url = https://github.com/wyrover/subhook
