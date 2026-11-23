@@ -28,6 +28,8 @@ enum class JitExitKind : int
     CpuFault,
 };
 
+struct CompiledProgram;
+
 struct JitContext
 {
     AMX* amx = nullptr;
@@ -57,6 +59,7 @@ struct JitContext
     uint32_t hostCallEsp8 = 0;
     uint32_t hostCallEsp16 = 0;
     JitContext* parentActive = nullptr;
+    const CompiledProgram* mutableProgram = nullptr;
 };
 
 /*
@@ -83,6 +86,7 @@ struct CompiledProgram
     cell topReturn = kTopReturn;
     std::vector<void*> dispatch;
     std::vector<cell> publicCips;
+    std::vector<unsigned char> codeSnapshot;
 };
 
 bool CompileProgram(AMX* amx, CompiledProgram& program);
@@ -110,16 +114,22 @@ void ShutdownPawnJITFaultContainment();
 class PawnJITRuntime
 {
 public:
+    using Interpreter = int(AMXAPI*)(AMX*, cell*, int);
+
     void OnLoad(AMX* amx);
     void OnUnload(AMX* amx);
     void Shutdown();
-    bool Execute(AMX* amx, cell* retval, int index, int& error);
+    bool Execute(AMX* amx, cell* retval, int index, int& error, Interpreter interpreter);
 
 private:
     struct State
     {
         bool compileAttempted = false;
         bool headerCaptured = false;
+        bool pendingJitCompile = false;
+        bool pendingYsiPublicRepair = false;
+        bool initializingJit = false;
+        bool mutableCode = false;
         unsigned char* loadedBase = nullptr;
         unsigned char* loadedData = nullptr;
         AMX_HEADER loadedHeader{};

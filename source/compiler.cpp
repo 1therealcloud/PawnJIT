@@ -3405,6 +3405,16 @@ namespace
         if (count == 0 || loops.components == 0)
             return analysis;
 
+        // Most components are single instructions outside loops. Group loop
+        // members once so range analysis does not rescan the whole program
+        // for every component and every induction candidate.
+        std::vector<std::vector<std::size_t>> membersByComponent(loops.components);
+        for (std::size_t node = 0; node < count; ++node)
+        {
+            if (loops.IsLoopInstruction(node))
+                membersByComponent[static_cast<std::size_t>(loops.component[node])].push_back(node);
+        }
+
         std::vector<std::vector<std::size_t>> reverse(count);
         for (std::size_t from = 0; from < cfg.successors.size(); ++from)
         {
@@ -3417,17 +3427,17 @@ namespace
 
         for (std::size_t componentId = 0; componentId < loops.components; ++componentId)
         {
-            bool isLoop = false;
+            const auto& members = membersByComponent[componentId];
+            if (members.empty())
+                continue;
+
             bool indirect = false;
             std::size_t externalEdges = 0;
             std::size_t externalPredecessor = count;
             std::size_t entryNode = count;
 
-            for (std::size_t node = 0; node < count; ++node)
+            for (std::size_t node : members)
             {
-                if (loops.component[node] != static_cast<int32_t>(componentId) || !loops.IsLoopInstruction(node))
-                    continue;
-                isLoop = true;
                 if (IsLoopIndirectControlBarrier(decoded.instructions[node]))
                     indirect = true;
                 for (std::size_t predecessor : reverse[node])
@@ -3441,8 +3451,6 @@ namespace
                 }
             }
 
-            if (!isLoop)
-                continue;
             if (indirect)
             {
                 continue;
@@ -3456,10 +3464,10 @@ namespace
                     continue;
                 }
 
-            for (std::size_t guard = 0; guard + 4 <= count; ++guard)
+            for (std::size_t guard : members)
             {
-                if (loops.component[guard] != static_cast<int32_t>(componentId))
-                    continue;
+                if (guard + 4 > count)
+                    break;
 
                 LoopSlot induction;
                 if (!DecodeLoopLoad(decoded.instructions[guard], true, induction))
@@ -3568,10 +3576,8 @@ namespace
                 std::size_t updateIndex = count;
                 std::size_t updateCount = 0;
                 bool invalidWrite = false;
-                for (std::size_t node = 0; node < count; ++node)
+                for (std::size_t node : members)
                 {
-                    if (loops.component[node] != static_cast<int32_t>(componentId))
-                        continue;
                     LoopSlot counterSlot;
                     bool increment = false;
                     if (DecodeLoopMemoryCounter(decoded.instructions[node], counterSlot, increment) && SameLoopSlot(counterSlot, induction))

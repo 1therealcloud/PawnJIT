@@ -25,7 +25,7 @@
 
 #include "runtime.hpp"
 
-using amx_Exec_t = int(AMXAPI*)(AMX* amx, cell* retval, int index);
+using amx_Exec_t = PawnJITRuntime::Interpreter;
 
 namespace
 {
@@ -271,7 +271,7 @@ namespace
                 alternate signal stack before we can safely enter the JIT
                 fault boundary.
             */
-            if (PreparePawnJITThreadFaultContainment() && g_pawnJITRuntime.Execute(amx, retval, index, error))
+            if (PreparePawnJITThreadFaultContainment() && g_pawnJITRuntime.Execute(amx, retval, index, error, g_originalExec))
             {
                 return error;
             }

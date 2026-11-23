@@ -8,12 +8,14 @@
 
 #include "runtime.hpp"
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <limits>
 #include <cstdio>
 #include <new>
+#include <string_view>
 
 #if defined(_WIN32) && defined(_MSC_VER)
 #   include <windows.h>
@@ -29,6 +31,79 @@ PawnJITRuntime g_pawnJITRuntime;
 
 namespace
 {
+    template <std::size_t NameSize>
+    int FindNamedPublic(const AMX* amx, const AmxImageInfo& image, const char (&nameToFind)[NameSize])
+    {
+        const AMX_HEADER& header = *image.header;
+        const unsigned char* entry = amx->base + header.publics;
+        for (std::size_t i = 0; i < image.publicCount; ++i, entry += header.defsize)
+        {
+            const char* name;
+            if (header.defsize == sizeof(AMX_FUNCSTUBNT))
+            {
+                const uint32_t offset = reinterpret_cast<const AMX_FUNCSTUBNT*>(entry)->nameofs;
+                if (offset < static_cast<uint32_t>(header.nametable) + sizeof(uint16_t) ||
+                    offset > static_cast<uint32_t>(header.cod) - NameSize)
+                {
+                    continue;
+                }
+                name = reinterpret_cast<const char*>(amx->base + offset);
+            }
+            else
+            {
+                if (NameSize > sizeof(AMX_FUNCSTUB::name))
+                    return -1;
+                name = reinterpret_cast<const AMX_FUNCSTUB*>(entry)->name;
+            }
+            if (std::memcmp(name, nameToFind, NameSize) == 0)
+                return static_cast<int>(i);
+        }
+        return -1;
+    }
+
+    void RemoveYsiPublicDuplicates(AMX* amx, const AmxImageInfo& image)
+    {
+        const AMX_HEADER& header = *image.header;
+        if (header.defsize != sizeof(AMX_FUNCSTUBNT) || image.publicCount < 2)
+            return;
+
+        auto* entries = reinterpret_cast<AMX_FUNCSTUBNT*>(amx->base + header.publics);
+        std::vector<std::string_view> names;
+        names.reserve(image.publicCount);
+        for (std::size_t i = 0; i < image.publicCount; ++i)
+        {
+            const uint32_t offset = entries[i].nameofs;
+            if (offset < static_cast<uint32_t>(header.nametable) + sizeof(uint16_t) || offset >= static_cast<uint32_t>(header.cod))
+                return;
+            const char* name = reinterpret_cast<const char*>(amx->base + offset);
+            const auto available = static_cast<std::size_t>(header.cod - offset);
+            const auto* end = static_cast<const char*>(std::memchr(name, '\0', std::min(available, std::size_t{sNAMEMAX + 1})));
+            if (end == nullptr)
+                return;
+            names.emplace_back(name, static_cast<std::size_t>(end - name));
+        }
+
+        // A second legacy y_hooks compaction can leave a stale prefix in
+        // front of a sorted table. Only touch it if every name is also in
+        // the sorted suffix. Keep indices stable for the open.mp caller.
+        auto suffix = names.end() - 1;
+        while (suffix != names.begin() && *(suffix - 1) < *suffix)
+            --suffix;
+        if (suffix == names.begin())
+            return;
+        for (auto name = names.begin(); name != suffix; ++name)
+        {
+            if (!std::binary_search(suffix, names.end(), *name))
+                return;
+        }
+        const uint32_t emptyName = entries[image.publicCount - 1].nameofs + static_cast<uint32_t>(names.back().size());
+        for (std::size_t i = 0; i < static_cast<std::size_t>(suffix - names.begin()); ++i)
+        {
+            entries[i].address = 0;
+            entries[i].nameofs = emptyName;
+        }
+    }
+
     unsigned char* GetData(AMX* amx)
     {
         if (amx == nullptr || amx->base == nullptr)
@@ -39,6 +114,26 @@ namespace
 
         auto* hdr = reinterpret_cast<AMX_HEADER*>(amx->base);
         return amx->base + hdr->dat;
+    }
+
+    bool CodeMatchesSnapshot(const CompiledProgram& program)
+    {
+        return program.codeSnapshot.empty() ||
+               std::memcmp(program.code, program.codeSnapshot.data(), program.codeSnapshot.size()) == 0;
+    }
+
+    int CheckCodeAfterExternalCall(const JitContext& context, int error)
+    {
+        const CompiledProgram* program = context.mutableProgram;
+        if (error != AMX_ERR_NONE || program == nullptr)
+            return error;
+
+        if (context.amx->base != program->base || GetData(context.amx) != program->data)
+            return AMX_ERR_INVSTATE;
+
+        // The next entry will recompile. Never resume this generated frame
+        // if the callback changed the instructions it is executing.
+        return CodeMatchesSnapshot(*program) ? AMX_ERR_NONE : AMX_ERR_INVSTATE;
     }
 
     bool CheckAddressStart(const JitContext* context, cell address)
@@ -731,6 +826,7 @@ int JitCallNative(JitContext* context, cell index, cell nextCip)
     if (context->unloadRequested != 0)
         return context->error = kInternalUnload;
 
+    callbackError = CheckCodeAfterExternalCall(*context, callbackError);
     if (callbackError != AMX_ERR_NONE)
     {
         context->error = callbackError;
@@ -920,6 +1016,7 @@ int JitDebugBreak(JitContext* context, cell cip)
     if (context->unloadRequested != 0)
         return context->error = kInternalUnload;
 
+    error = CheckCodeAfterExternalCall(*context, error);
     if (error != AMX_ERR_NONE)
     {
         context->error = error;
@@ -954,6 +1051,14 @@ void PawnJITRuntime::OnLoad(AMX* amx)
             */
             std::memcpy(&state.loadedHeader, amx->base, sizeof(state.loadedHeader));
             state.headerCaptured = true;
+
+            AmxImageInfo image;
+            if (ValidateAmxImage(amx, &image))
+            {
+                state.pendingJitCompile = FindNamedPublic(amx, image, "OnJITCompile") >= 0;
+                state.pendingYsiPublicRepair = state.pendingJitCompile &&
+                    FindNamedPublic(amx, image, "ScriptInit_OnJITCompile") >= 0 && FindNamedPublic(amx, image, "_ScriptInit_FixState") >= 0;
+            }
         }
     }
     catch (...)
@@ -1042,7 +1147,16 @@ bool PawnJITRuntime::CanExecuteJit(AMX* amx, const State& state) const
         return false;
     }
 
-    if (std::memcmp(amx->base, &state.loadedHeader, sizeof(state.loadedHeader)) != 0)
+    AMX_HEADER header;
+    std::memcpy(&header, amx->base, sizeof(header));
+    // YSI can move the public table and redirect main during startup.
+    // Both entry points are resolved from the live header before use.
+    if (state.mutableCode)
+    {
+        header.publics = state.loadedHeader.publics;
+        header.cip = state.loadedHeader.cip;
+    }
+    if (std::memcmp(&header, &state.loadedHeader, sizeof(header)) != 0)
         return false;
 
     if ((amx->flags & AMX_FLAG_BROWSE) != 0)
@@ -1107,16 +1221,11 @@ bool PawnJITRuntime::ProgramMatchesAmx(AMX* amx, const CompiledProgram& program)
         return false;
 
     const AMX_HEADER* hdr = image.header;
-    return program.code == amx->base + hdr->cod && program.codeSize == image.codeSize && program.hlw == amx->hlw && program.stp == amx->stp;
+    return program.code == amx->base + hdr->cod && program.codeSize == image.codeSize && program.hlw == amx->hlw && program.stp == amx->stp && CodeMatchesSnapshot(program);
 }
 
 bool PawnJITRuntime::EnsureCompiled(AMX* amx, State& state)
 {
-    /*
-        open.mp keeps the loaded P-code structurally stable for our
-        purposes. recompile only when the AMX backing storage or
-        structural metadata changes.
-    */
     if (state.program != nullptr && !ProgramMatchesAmx(amx, *state.program))
     {
         /*
@@ -1143,9 +1252,17 @@ bool PawnJITRuntime::EnsureCompiled(AMX* amx, State& state)
     if (program == nullptr)
         return false;
 
+    std::vector<unsigned char> codeSnapshot;
+    if (state.mutableCode)
+    {
+        const auto* header = reinterpret_cast<const AMX_HEADER*>(amx->base);
+        codeSnapshot.assign(amx->base + header->cod, amx->base + header->dat);
+    }
+
     if (!CompileProgram(amx, *program))
         return false;
 
+    program->codeSnapshot = std::move(codeSnapshot);
     state.program = std::move(program);
     return true;
 }
@@ -1365,6 +1482,7 @@ bool PawnJITRuntime::RunPreparedContext(AMX* amx, State& state, JitContext& cont
         return false;
 
     context.parentActive = state.activeContext;
+    context.mutableProgram = state.mutableCode ? state.program.get() : nullptr;
     state.activeContext = &context;
     ++state.activeExecutions;
 
@@ -1504,7 +1622,7 @@ void PawnJITRuntime::SyncAfterRun(JitContext& context, cell* retval, int error) 
         *retval = context.pri;
 }
 
-bool PawnJITRuntime::Execute(AMX* amx, cell* retval, int index, int& error)
+bool PawnJITRuntime::Execute(AMX* amx, cell* retval, int index, int& error, Interpreter interpreter)
 {
     /*
         fast path for synchronous recursive public execution of the AMX
@@ -1520,7 +1638,7 @@ bool PawnJITRuntime::Execute(AMX* amx, cell* retval, int index, int& error)
         CompiledProgram* const program = state.program.get();
         const std::size_t publicIndex = static_cast<std::size_t>(index);
 
-        if (!state.unloadPending && !state.jitQuarantined && program != nullptr && CanExecuteJit(amx, state) && ProgramMatchesAmx(amx, *program) &&
+        if (!state.mutableCode && !state.unloadPending && !state.jitQuarantined && program != nullptr && CanExecuteJit(amx, state) && ProgramMatchesAmx(amx, *program) &&
             publicIndex < program->publicCips.size() && program->publicCips[publicIndex] >= 0)
         {
             const cell entryCip = program->publicCips[publicIndex];
@@ -1532,22 +1650,84 @@ bool PawnJITRuntime::Execute(AMX* amx, cell* retval, int index, int& error)
         }
     }
 
-    State* const statePtr = GetState(amx);
-    if (statePtr == nullptr)
+    State* statePtr = GetState(amx);
+    if (statePtr != nullptr && statePtr->pendingYsiPublicRepair && statePtr->mutableCode && amx->base == statePtr->loadedBase)
+    {
+        AmxImageInfo image;
+        if (ValidateAmxImage(amx, &image) && image.header->publics > statePtr->loadedHeader.publics &&
+            image.header->defsize == statePtr->loadedHeader.defsize && image.header->natives == statePtr->loadedHeader.natives &&
+            image.header->nametable == statePtr->loadedHeader.nametable && image.header->cod == statePtr->loadedHeader.cod)
+        {
+            RemoveYsiPublicDuplicates(amx, image);
+            statePtr->pendingYsiPublicRepair = false;
+        }
+    }
+    if (statePtr == nullptr || statePtr->initializingJit || statePtr->jitQuarantined || !CanExecuteJit(amx, *statePtr))
         return false;
+
+    if (statePtr->pendingJitCompile || (statePtr->mutableCode && index == AMX_EXEC_MAIN))
+    {
+        if (interpreter == nullptr)
+            return false;
+
+        if (statePtr->pendingJitCompile)
+        {
+            // Leave pending parameters and suspended executions to the VM.
+            if (index == AMX_EXEC_CONT || amx->paramcount != 0)
+                return false;
+
+            AmxImageInfo image;
+            if (!ValidateAmxImage(amx, &image))
+                return false;
+            const int callback = FindNamedPublic(amx, image, "OnJITCompile");
+            statePtr->pendingJitCompile = false;
+            if (callback < 0)
+            {
+                statePtr->jitQuarantined = true;
+                return false;
+            }
+
+            const AmxExecutionSnapshot snapshot = CaptureAmxState(amx);
+            statePtr->initializingJit = true;
+            cell accepted = 0;
+            const int result = interpreter(amx, &accepted, callback);
+
+            // A native called by the callback may unload the script.
+            statePtr = GetState(amx);
+            if (statePtr == nullptr || !statePtr->initializingJit)
+            {
+                error = AMX_ERR_EXIT;
+                return true;
+            }
+            statePtr->jitQuarantined = result != AMX_ERR_NONE || accepted == 0;
+            statePtr->mutableCode = !statePtr->jitQuarantined;
+            if (index == callback)
+            {
+                statePtr->initializingJit = false;
+                if (retval != nullptr && result == AMX_ERR_NONE)
+                    *retval = accepted;
+                error = result;
+                return true;
+            }
+            if (result != AMX_ERR_NONE)
+                RestoreAmxState(amx, snapshot);
+        }
+
+        // Keep nested calls in the VM throughout initialization.
+        statePtr->initializingJit = true;
+        error = interpreter(amx, retval, index);
+        statePtr = GetState(amx);
+        if (statePtr != nullptr)
+            statePtr->initializingJit = false;
+        return true;
+    }
     State& state = *statePtr;
-
-    if (!CanExecuteJit(amx, state))
-        return false;
-
-    if (state.jitQuarantined)
-        return false;
 
     if (!EnsureCompiled(amx, state))
         return false;
 
     cell entryCip = 0;
-    if (index >= 0)
+    if (index >= 0 && !state.mutableCode)
     {
         const std::size_t publicIndex = static_cast<std::size_t>(index);
         if (state.program == nullptr || publicIndex >= state.program->publicCips.size() || state.program->publicCips[publicIndex] < 0)
