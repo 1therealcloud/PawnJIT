@@ -79,3 +79,33 @@ jobs:
             release-files/PawnJIT.pdb
             release-files/PawnJIT.so
           generate_release_notes: true
+
+  nightly:
+    name: Update nightly release
+    needs: [build-windows, build-linux]
+    if: github.ref == 'refs/heads/master'
+    runs-on: ubuntu-latest
+    concurrency:
+      group: nightly-release
+      cancel-in-progress: false
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-files
+          merge-multiple: true
+
+      - name: Recreate nightly release
+        run: |
+          gh release delete nightly --repo "${{ github.repository }}" --cleanup-tag --yes || true
+          gh release create nightly \
+            --repo "${{ github.repository }}" \
+            --target "${{ github.sha }}" \
+            --title "Nightly (${GITHUB_SHA::7})" \
+            --notes "Latest nightly build from commit ${{ github.sha }}. May be unstable." \
+            --prerelease \
+            release-files/PawnJIT.dll \
+            release-files/PawnJIT.pdb \
+            release-files/PawnJIT.so
