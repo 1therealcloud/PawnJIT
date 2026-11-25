@@ -22,13 +22,15 @@ jobs:
         run: cmake -S . -B build -A Win32
 
       - name: Build
-        run: cmake --build build --config Release --parallel
+        run: cmake --build build --config RelWithDebInfo --parallel
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: PawnJIT-windows-x86
-          path: build/Release/PawnJIT.dll
+          path: |
+            build/RelWithDebInfo/PawnJIT.dll
+            build/RelWithDebInfo/PawnJIT.pdb
           if-no-files-found: error
 
   build-linux:
@@ -45,7 +47,7 @@ jobs:
           sudo apt-get install -y gcc-multilib g++-multilib cmake ninja-build
 
       - name: Configure
-        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo
 
       - name: Build
         run: cmake --build build --parallel
@@ -74,5 +76,6 @@ jobs:
         with:
           files: |
             release-files/PawnJIT.dll
+            release-files/PawnJIT.pdb
             release-files/PawnJIT.so
           generate_release_notes: true
